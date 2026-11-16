@@ -229,7 +229,7 @@
       <div id="poiTitle" class="poi-title">Ready to explore</div>
       <div id="poiMeta" class="poi-meta">Tap "Start Tour" or pre-load a route above</div>
       <p id="poiScript" class="poi-script">
-        As you move, the app checks your pre-loaded route cache first (even without cell signal) or queries live Wikipedia landmarks ahead of your path, then reads a historical anecdote aloud.
+        As you move, the app checks your pre-loaded route cache first (even without cell signal) or queries live Wikipedia historic landmarks ahead of your path, then reads a historical anecdote aloud.
       </p>
     </div>
     <audio id="audioPlayer" controls></audio>
@@ -341,6 +341,49 @@
   function log(msg) {
     const time = new Date().toLocaleTimeString([], { hour12: false });
     logBox.textContent = `[${time}] ${msg}\n` + logBox.textContent;
+  }
+
+  // --- POI Quality Filtering & Historic Scoring ---
+  const GENERIC_TITLE_PATTERN = /\b(township|county|borough|municipality|unincorporated community|census-designated place|cdp|school district|shopping center|shopping mall|post office|interstate \d+|u\.s\. route \d+|state route \d+)\b/i;
+
+  const GENERIC_LEAD_PATTERN = /\b(is a|was a)\b[^.]{0,60}\b(census-designated place|unincorporated community|civil township|township in|borough in|county in|city in|town in|village in|hamlet in|municipality in|school district|shopping mall|strip mall|subway station|metro station|bus station)\b/i;
+
+  const SCHOOL_PATTERN = /\b(elementary school|middle school|high school|junior high|preparatory school|charter school|parochial school|catholic school|public school|private school|community college|technical college|schoolhouse|academy)\b/i;
+
+  const HISTORIC_BOOST_PATTERN = /\b(historic|historical|national register|battle|battlefield|monument|memorial|museum|fort|mansion|plantation|covered bridge|lighthouse|cemetery|ruins|archaeological|landmark|founded in 1[678]\d\d|built in 1[678]\d\d|18th-century|19th-century|colonial|civil war|revolutionary war)\b/i;
+
+  function isGenericPlace(title, extract = '') {
+    if (GENERIC_TITLE_PATTERN.test(title)) return true;
+
+    const firstSentence = extract ? (extract.split(/\.\s+/)[0] || '') : '';
+    if (firstSentence && GENERIC_LEAD_PATTERN.test(firstSentence)) return true;
+
+    // School check: allow ONLY if genuine historical significance is present
+    const isSchool = SCHOOL_PATTERN.test(title) || SCHOOL_PATTERN.test(firstSentence);
+    if (isSchool) {
+      if (!extract) {
+        return !HISTORIC_BOOST_PATTERN.test(title);
+      }
+      const combinedText = `${title} ${extract}`;
+      if (!HISTORIC_BOOST_PATTERN.test(combinedText)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function scoreLandmark(item) {
+    let score = 0;
+    const text = `${item.title} ${item.extract || ''}`;
+
+    const matches = text.match(new RegExp(HISTORIC_BOOST_PATTERN.source, 'gi'));
+    if (matches) score += Math.min(matches.length * 15, 60);
+
+    if (typeof item.dist === 'number') {
+      score += Math.max(0, 20 - (item.dist / 250));
+    }
+    return score;
   }
 
   // --- Offline Route Cache Helpers ---
@@ -593,12 +636,12 @@
 
       for (let i = 0; i < checkpoints.length; i++) {
         const pt = checkpoints[i];
-        const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${pt.lat}|${pt.lon}&gsradius=${searchRadius}&gslimit=12&format=json&origin=*`;
+        const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${pt.lat}|${pt.lon}&gsradius=${searchRadius}&gslimit=25&format=json&origin=*`;
         const res = await fetch(wikiUrl);
         const data = await res.json();
         const items = data?.query?.geosearch || [];
         for (const item of items) {
-          if (!discovered.has(item.pageid)) {
+          if (!discovered.has(item.pageid) && !isGenericPlace(item.title)) {
             discovered.set(item.pageid, {
               pageid: item.pageid,
               title: item.title,
@@ -613,7 +656,7 @@
       }
 
       const allIds = [...discovered.keys()];
-      log(`Found ${allIds.length} unique landmarks. Downloading article summaries...`);
+      log(`Found ${allIds.length} candidate landmarks. Filtering & downloading summaries...`);
 
       const cache = {};
       let addedCount = 0;
@@ -627,8 +670,8 @@
 
         for (const id of batchIds) {
           const extract = pages[id]?.extract || '';
-          if (extract && extract.length >= 60) {
-            const meta = discovered.get(id);
+          const meta = discovered.get(id);
+          if (extract && extract.length >= 60 && !isGenericPlace(meta.title, extract)) {
             cache[id] = {
               pageid: id,
               title: meta.title,
@@ -646,7 +689,7 @@
 
       const summary = `${startPt.name} → ${endPt.name} (${miles} mi)`;
       saveRouteCache(cache, summary);
-      log(`Pre-load complete! Cached ${addedCount} landmarks for "${summary}".`);
+      log(`Pre-load complete! Cached ${addedCount} historic landmarks for "${summary}".`);
 
     } catch (err) {
       log(`Pre-load error: ${err.message}`);
@@ -824,7 +867,7 @@
       const routeCache = getRouteCache();
 
       let candidates = Object.values(routeCache)
-        .filter(item => !heard.has(item.pageid))
+        .filter(item => !heard.has(item.pageid) && !isGenericPlace(item.title, item.extract))
         .map(item => ({
           ...item,
           dist: haversineMeters(coords.latitude, coords.longitude, item.lat, item.lon),
@@ -839,20 +882,20 @@
           isProcessing = false;
           return;
         }
-        const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${coords.latitude}|${coords.longitude}&gsradius=${radius}&gslimit=15&format=json&origin=*`;
+        const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${coords.latitude}|${coords.longitude}&gsradius=${radius}&gslimit=25&format=json&origin=*`;
         log(`Querying live Wikipedia within ${radius}m...`);
         const res = await fetch(wikiUrl);
         const data = await res.json();
         const results = data?.query?.geosearch || [];
         candidates = results
-          .filter(item => !heard.has(item.pageid))
+          .filter(item => !heard.has(item.pageid) && !isGenericPlace(item.title))
           .map(item => ({ ...item, fromCache: false }));
       } else {
         log(`Matched ${candidates.length} landmarks from offline route cache.`);
       }
 
       if (candidates.length === 0) {
-        log('No unheard Wikipedia landmarks nearby.');
+        log('No unheard historic landmarks nearby.');
         isProcessing = false;
         return;
       }
@@ -868,25 +911,41 @@
         }
       }
 
-      const target = candidates[0];
-      const distanceMeters = Math.round(target.dist);
-      const relativeDir = getRelativeDirection(coords, target.lat, target.lon);
-      log(`Selected: "${target.title}" (${distanceMeters}m, ${relativeDir}${target.fromCache ? ' • Cached' : ''})`);
+      // Rank by historical relevance + proximity
+      candidates.sort((a, b) => scoreLandmark(b) - scoreLandmark(a));
 
-      let extract = target.extract || '';
-      if (!extract) {
-        const extractUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&pageids=${target.pageid}&format=json&origin=*`;
-        const extRes = await fetch(extractUrl);
-        const extData = await extRes.json();
-        extract = extData?.query?.pages?.[target.pageid]?.extract || '';
+      let target = null;
+      let extract = '';
+
+      for (const candidate of candidates) {
+        let candidateExtract = candidate.extract || '';
+        if (!candidateExtract) {
+          const extractUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&pageids=${candidate.pageid}&format=json&origin=*`;
+          const extRes = await fetch(extractUrl);
+          const extData = await extRes.json();
+          candidateExtract = extData?.query?.pages?.[candidate.pageid]?.extract || '';
+        }
+
+        if (!candidateExtract || candidateExtract.length < 60 || isGenericPlace(candidate.title, candidateExtract)) {
+          log(`Skipping generic/non-historic entry: "${candidate.title}"`);
+          markAsHeard(candidate.pageid);
+          continue;
+        }
+
+        target = candidate;
+        extract = candidateExtract;
+        break;
       }
 
-      if (!extract || extract.length < 60) {
-        log(`Skipping "${target.title}" (insufficient text).`);
-        markAsHeard(target.pageid);
+      if (!target) {
+        log('No qualifying historic landmarks found in this scan.');
         isProcessing = false;
         return;
       }
+
+      const distanceMeters = Math.round(target.dist);
+      const relativeDir = getRelativeDirection(coords, target.lat, target.lon);
+      log(`Selected: "${target.title}" (${distanceMeters}m, ${relativeDir}${target.fromCache ? ' • Cached' : ''})`);
 
       const script = await generateNarrationScript(target.title, distanceMeters, relativeDir, extract);
 
@@ -907,12 +966,30 @@
     }
   }
 
+  // Strips Wikipedia's opening "located in City, State, United States" boilerplate
+  function cleanWikiSummary(wikiExtract) {
+    const sentences = wikiExtract
+      .replace(/\b(St|Dr|Mr|Mrs|Ms|Gen|Col|Capt|Gov|Sen|Rep|Rev|U\.S)\./g, '$1<PRD>')
+      .split(/\.\s+/)
+      .map(s => s.replace(/<PRD>/g, '.').trim())
+      .filter(Boolean);
+
+    if (sentences.length <= 1) return wikiExtract;
+
+    const locationBoilerplate = /\b(is a|was a|are a)\b.*\b(located in|situated in|unincorporated community in|census-designated place in|town in|city in|borough in|village in|township in|county in|neighborhood in|district in)\b/i;
+
+    const startIndex = locationBoilerplate.test(sentences[0]) ? 1 : 0;
+    const picked = sentences.slice(startIndex, startIndex + 2);
+
+    return (picked.length > 0 ? picked : sentences.slice(0, 2)).join('. ') + '.';
+  }
+
   async function generateNarrationScript(title, distanceMeters, relativeDir, wikiExtract) {
     const key = apiKeyInput.value.trim();
     const capDir = relativeDir.charAt(0).toUpperCase() + relativeDir.slice(1);
 
     if (!key || !navigator.onLine) {
-      const summary = wikiExtract.split('. ').slice(0, 2).join('. ') + '.';
+      const summary = cleanWikiSummary(wikiExtract);
       return `${capDir} is ${title}. ${summary}`;
     }
 
@@ -933,7 +1010,12 @@
           messages: [
             {
               role: 'system',
-              content: 'You are a witty, engaging radio tour guide narrating for a driver passing a landmark. Start by naturally orienting the driver using the provided relative direction (e.g., "Ahead on your left..."), then share a punchy 3-sentence spoken anecdote (max 65 words total) highlighting the most surprising historical fact. Never say "As you can see in this photo" or use markdown/bullet points.'
+              content: [
+                'You are a witty, engaging radio tour guide narrating for a driver passing a landmark.',
+                'Start by naturally orienting the driver using the provided relative direction (e.g., "Ahead on your left..."), then share a punchy 3-sentence spoken anecdote (max 65 words total) highlighting the most surprising historical fact.',
+                'CRITICAL: The listener is already driving right past it—NEVER mention the city, county, state, province, or country it is located in (e.g., skip "located in Pennsylvania, United States"). Jump straight into what makes it interesting.',
+                'Never say "As you can see in this photo" or use markdown/bullet points.'
+              ].join(' ')
             },
             {
               role: 'user',
@@ -948,7 +1030,7 @@
       return data.choices[0].message.content.trim();
     } catch (err) {
       log(`AI script fallback (${err.message})`);
-      const summary = wikiExtract.split('. ').slice(0, 2).join('. ') + '.';
+      const summary = cleanWikiSummary(wikiExtract);
       return `${capDir} is ${title}. ${summary}`;
     }
   }
